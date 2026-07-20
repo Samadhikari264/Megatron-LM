@@ -24,15 +24,22 @@ from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw,
 
 
 class MockInferenceInterface(ReturnsRaw):
-    """Mock raw-text inference interface with configurable per-prompt delays."""
+    """Mock raw-text inference interface with configurable per-prompt delays.
+
+    Prompts at index >= stall_after_calls park forever, modeling a suspended
+    engine whose set of completable rollouts is exact and scheduling-independent.
+    """
 
     num_slow_calls: int = 0
+    stall_after_calls: int | None = None
     active_requests: int = 0
     max_active_requests: int = 0
 
     async def base_generate(self, request):
         prompt = request.prompt[0].content
         idx = int(prompt.removeprefix("t"))
+        if self.stall_after_calls is not None and idx >= self.stall_after_calls:
+            await asyncio.Event().wait()
         self.active_requests += 1
         self.max_active_requests = max(self.max_active_requests, self.active_requests)
         try:
@@ -265,11 +272,10 @@ class TestStageFailurePropagation:
         )
         pipeline = RolloutPipeline(BrokenBuildGenerator(), request, parallel_generation_tasks=1)
         async with aclosing(pipeline.run()) as it:
-            # Group 0 is healthy and must still be delivered.
-            group = await asyncio.wait_for(anext(it), timeout=10)
-            assert len(group.rollouts) == 2
-            # Group 1's build_rollout kills stage_assemble; the next pull must
-            # surface that failure instead of hanging on the drained stream.
+            # Group 0 assembles healthily but stays parked in its incomplete
+            # batch: stage_bank delivers full batches only, so group 1's
+            # build_rollout death (which kills stage_assemble) must surface on
+            # the first pull instead of hanging on the drained stream.
             with pytest.raises(RuntimeError, match="stage died") as excinfo:
                 await asyncio.wait_for(anext(it), timeout=10)
         assert isinstance(excinfo.value.__cause__, ValueError)
@@ -327,17 +333,28 @@ class TestGroupedRollouts:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         (
-            "num_slow_calls, streaming, num_groups, submission_granularity, "
-            "consumption_granularity, expected_count, expected_batch_ids, "
-            "expected_trajectories"
+            "num_slow_calls, stall_after_calls, streaming, num_groups, "
+            "submission_granularity, consumption_granularity, expected_count, "
+            "expected_batch_ids, expected_trajectories, expects_ready_batch"
         ),
         [
-            pytest.param(0, False, 8, "B", "B", 8, None, None, id="non_batched"),
+            pytest.param(0, None, False, 8, "B", "B", 8, None, None, False, id="non_batched"),
             pytest.param(
-                0, False, 4, "B", "B", 4, None, None, id="non_streaming_fewer_than_parallel"
+                0,
+                None,
+                False,
+                4,
+                "B",
+                "B",
+                4,
+                None,
+                None,
+                False,
+                id="non_streaming_fewer_than_parallel",
             ),
             pytest.param(
                 4,
+                None,
                 True,
                 2,
                 "B",
@@ -345,11 +362,13 @@ class TestGroupedRollouts:
                 8,
                 [0, 0, 1, 1, 2, 2, 3, 3],
                 None,
+                None,
                 id="batched_submission_order",
             ),
-            pytest.param(0, True, 1, "G", "B", 10, None, None, id="streaming"),
+            pytest.param(0, None, True, 1, "G", "B", 10, None, None, None, id="streaming"),
             pytest.param(
                 4,
+                None,
                 True,
                 1,
                 "G",
@@ -357,10 +376,12 @@ class TestGroupedRollouts:
                 8,
                 None,
                 [f"t{i}" for i in range(4, 8)],
+                None,
                 id="group_consume_completion_order",
             ),
             pytest.param(
                 4,
+                None,
                 True,
                 1,
                 "G",
@@ -368,13 +389,31 @@ class TestGroupedRollouts:
                 8,
                 list(range(8)),
                 [f"t{i}" for i in range(8)],
+                None,
                 id="batch_consume_submission_order",
+            ),
+            # 6 completable rollouts, then the engine stalls (as when
+            # suspended): whole batches bank without further generation and
+            # the can_skip_inference read finds one ready.
+            pytest.param(
+                0,
+                6,
+                True,
+                2,
+                "B",
+                "B",
+                2,
+                [0, 0],
+                ["t0", "t1"],
+                True,
+                id="stalled_engine_banks_ready_batches",
             ),
         ],
     )
     async def test_grouped_rollout_generation(
         self,
         num_slow_calls,
+        stall_after_calls,
         streaming,
         num_groups,
         submission_granularity,
@@ -382,29 +421,43 @@ class TestGroupedRollouts:
         expected_count,
         expected_batch_ids,
         expected_trajectories,
+        expects_ready_batch,
     ):
         gen = MockGenerator()
         request = GroupedRolloutRequest(
             num_groups=num_groups,
             rollouts_per_group=1,
-            inference_interface=MockInferenceInterface(num_slow_calls=num_slow_calls),
+            inference_interface=MockInferenceInterface(
+                num_slow_calls=num_slow_calls, stall_after_calls=stall_after_calls
+            ),
             streaming=streaming,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
         )
 
         groups = []
-        async for group in RolloutPipeline(gen, request, parallel_generation_tasks=8).run():
-            groups.append(group)
-            if request.streaming and len(groups) >= expected_count:
-                break
+        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=8)
+        # Hold the iterator open through the assertions: abandoning it lets the
+        # event loop finalize run(), cancelling the stages that bank batches.
+        async with aclosing(pipeline.run()) as iterator:
+            async for group in iterator:
+                groups.append(group)
+                if request.streaming and len(groups) >= expected_count:
+                    break
 
-        assert len(groups) == expected_count
-        if expected_batch_ids is not None:
-            assert [g.batch_id for g in groups] == expected_batch_ids
-        if expected_trajectories is not None:
-            trajectories = [group[0].trajectory[0] for group in groups]
-            assert trajectories[: len(expected_trajectories)] == expected_trajectories
+            assert len(groups) == expected_count
+            if expected_batch_ids is not None:
+                assert [g.batch_id for g in groups] == expected_batch_ids
+            if expected_trajectories is not None:
+                trajectories = [group[0].trajectory[0] for group in groups]
+                assert trajectories[: len(expected_trajectories)] == expected_trajectories
+            if expects_ready_batch is not None:
+                if expects_ready_batch:
+                    assert await pipeline._drain() >= 1
+                else:
+                    assert pipeline.ready_batches == 0
+            assert pipeline.yielded_count == len(groups)
+            assert len(pipeline.output_queue_dwell) == len(groups)
 
     @pytest.mark.asyncio
     async def test_rollout_submission_granularity_limits_inference_concurrency(self):
@@ -473,8 +526,21 @@ class TestGroupedRollouts:
         assert pipeline.gate.held == 0
 
     @pytest.mark.asyncio
-    async def test_group_consumption_balances_each_batch(self):
-        """Balanced G: every trainer-batch window holds each env's exact share."""
+    @pytest.mark.parametrize(
+        "num_slow_calls, stall_after_calls, collect_count, expects_ready_batch",
+        [
+            pytest.param(2, None, 12, None, id="balanced_windows"),
+            # Both envs complete prompts t0-t5: env "a" (3 groups/batch) has
+            # two complete rounds' worth, env "b" six, so balanced rounds bank
+            # and the can_skip_inference read finds one ready.
+            pytest.param(0, 6, 4, True, id="stalled_engine_banks_complete_rounds"),
+        ],
+    )
+    async def test_group_consumption_balances_each_batch(
+        self, num_slow_calls, stall_after_calls, collect_count, expects_ready_batch
+    ):
+        """Balanced G: every trainer-batch window holds each env's exact share,
+        and a banked batch is one complete round."""
         configs = [
             AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
             AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
@@ -484,20 +550,26 @@ class TestGroupedRollouts:
         request = GroupedRolloutRequest(
             num_groups=4,
             rollouts_per_group=1,
-            inference_interface=MockInferenceInterface(num_slow_calls=2),
+            inference_interface=MockInferenceInterface(
+                num_slow_calls=num_slow_calls, stall_after_calls=stall_after_calls
+            ),
             streaming=True,
             submission_granularity="G",
             consumption_granularity="G",
         )
         groups = []
-        async for group in RolloutPipeline(mt, request, parallel_generation_tasks=2).run():
-            groups.append(group)
-            if len(groups) >= 12:
-                break
+        pipeline = RolloutPipeline(mt, request, parallel_generation_tasks=2)
+        async with aclosing(pipeline.run()) as iterator:
+            async for group in iterator:
+                groups.append(group)
+                if len(groups) >= collect_count:
+                    break
 
-        for start in range(0, 12, 4):
-            env_ids = [g[0].env_id for g in groups[start : start + 4]]
-            assert sorted(env_ids) == ["a", "a", "a", "b"]
+            for start in range(0, collect_count, 4):
+                env_ids = [g[0].env_id for g in groups[start : start + 4]]
+                assert sorted(env_ids) == ["a", "a", "a", "b"]
+            if expects_ready_batch:
+                assert await pipeline._drain() >= 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

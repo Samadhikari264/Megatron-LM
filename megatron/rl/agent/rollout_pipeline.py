@@ -245,6 +245,9 @@ class RolloutPipeline:
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
         self.output_queue = asyncio_Queue()
+        self.bank = asyncio_Queue()
+        self.banked_batches = 0
+        self.consumed_batches = 0
 
         # Buffers of partial results.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
@@ -274,6 +277,7 @@ class RolloutPipeline:
             asyncio.create_task(self.stage_prepare()),
             asyncio.create_task(self.stage_infer()),
             asyncio.create_task(self.stage_assemble()),
+            asyncio.create_task(self.stage_bank()),
         )
         try:
             async for group in self.stage_consume():
@@ -432,7 +436,7 @@ class RolloutPipeline:
             self.output_queue.shutdown()
 
     def _record_output_dwell(self, group: RolloutGroup) -> None:
-        """Record how long a group sat in output_queue before being yielded."""
+        """Record how long a group waited between assembly and being yielded."""
         key = (group.batch_id, group.index_in_batch)
         enqueued_at = self._output_enqueued_at.pop(key, 0.0)
         if enqueued_at:
@@ -441,22 +445,84 @@ class RolloutPipeline:
         self.yielded_groups_per_env[self.gran_policy.env_of_index(group.index_in_batch)] += 1
 
     async def _next_complete_group(self) -> RolloutGroup | None:
-        """Pop the next group off output_queue and record its dwell."""
+        """Pop the next group off output_queue."""
         try:
-            group = await self.output_queue.get()
+            return await self.output_queue.get()
         except asyncio_QueueShutDown:
             return None
-        self._record_output_dwell(group)
-        return group
 
-    async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
-        """Deliver groups in the order defined by the consumption granularity."""
-        consume = {
+    @property
+    def ready_batches(self) -> int:
+        """Full batches banked and not yet dequeued for consumption."""
+        return self.banked_batches - self.consumed_batches
+
+    async def _drain(self) -> int:
+        """Pump generated groups into banks until one is ready or the pipeline stalls.
+        Suspended engines cannot complete inference, so this drain must halt in a bounded time.
+
+        Returns:
+            int: The number of full batches ready to consume.
+        """
+        previous = None
+        stable = 0
+        # There will be at least one turn that does not change the metrics:
+        # `stage_assemble` advances a group without updating any counters.
+        while self.ready_batches < 1 and stable < 2:
+            await asyncio.sleep(0)
+            progress = (
+                self.prepared_count,
+                self.inferred_count,
+                self.assembled_count,
+                self.banked_batches,
+                self.infer_queue.qsize(),
+                self.assemble_queue.qsize(),
+                self.output_queue.qsize(),
+            )
+            stable = stable + 1 if progress == previous else 0
+            previous = progress
+        return self.ready_batches
+
+    def settle(self, loop: asyncio.AbstractEventLoop) -> int:
+        """Synchronously drain to quiescence; return full batches ready to consume."""
+        return loop.run_until_complete(self._drain())
+
+    async def stage_bank(self) -> None:
+        """Bank complete batches cut from the consumption-ordered group stream."""
+        order = {
             "G": self._consume_completion_order,
             "B": self._consume_batch_order,
         }[self.gran_policy.consumption]
-        async for group in consume():
-            yield group
+        batch: list[RolloutGroup] = []
+        try:
+            async for group in order():
+                batch.append(group)
+                if len(batch) == self.gran_policy.num_groups_per_batch:
+                    self.bank.put_nowait(batch)
+                    self.banked_batches += 1
+                    batch = []
+            assert self.request.streaming or not (batch or self._consume_pending), (
+                "Stream ended with groups not forming a full batch."
+            )
+        finally:
+            self.bank.shutdown()
+
+    async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
+        """Unwrap banked batches for the consumer, freeing gate slots as it goes.
+
+        Yields:
+            RolloutGroup: Groups ordered by the configured consumption mode.
+        """
+        while True:
+            try:
+                batch = await self.bank.get()
+            except asyncio_QueueShutDown:
+                return
+            self.consumed_batches += 1
+            for group in batch:
+                self._record_output_dwell(group)
+                yield group
+                self.gate.release_for("G")
+            self.gate.release_for("B")
 
     async def _consume_completion_order(self) -> AsyncIterator[RolloutGroup]:
         """G consumption: deliver groups in completion order, balanced across envs."""
@@ -474,7 +540,6 @@ class RolloutPipeline:
                 for env, queue in enumerate(pending_groups_by_env):
                     if queue and delivered_groups_by_env[env] < groups_per_env_per_batch[env]:
                         yield queue.popleft()
-                        self.gate.release_for("G")
                         delivered_groups_by_env[env] += 1
                         yielded_any = True
                 if all(
@@ -486,7 +551,6 @@ class RolloutPipeline:
         for queue in pending_groups_by_env:
             while queue:
                 yield queue.popleft()
-                self.gate.release_for("G")
 
     async def _consume_batch_order(self) -> AsyncIterator[RolloutGroup]:
         """B consumption: deliver whole batches in dataset order."""
@@ -503,5 +567,3 @@ class RolloutPipeline:
                 next_batch_id += 1
                 for group in batch:
                     yield group
-                    self.gate.release_for("G")
-                self.gate.release_for("B")
