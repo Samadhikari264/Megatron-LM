@@ -280,6 +280,17 @@ class RolloutPipeline:
     async def run(self) -> AsyncIterator[RolloutGroup]:
         """Run the pipeline stages; cancels them when the iterator is closed.
 
+        Raises:
+            RuntimeError: If the output stream ends on its own before a
+                non-streaming request delivered all of its groups, or ends at
+                all for a streaming request. Both only happen when a dying
+                stage ran the queue-shutdown cascade — which is otherwise
+                indistinguishable from a clean end-of-stream. The dead stage's
+                exception (stored on the task, never awaited) is chained as the
+                cause. Without this, an agent-side exception in the first group
+                read as "no more data" and the trainer idled to its time limit
+                (observed 2026-07-30, TypeError in stage_prepare).
+
         Yields:
             RolloutGroup: Groups in consumption-granularity order.
         """
@@ -291,6 +302,33 @@ class RolloutPipeline:
         try:
             async for group in self.stage_consume():
                 yield group
+            # End of stream. For a non-streaming request that delivered every
+            # group this is the normal completion; every stage has already
+            # returned. Reap the stages either way (cancelling a completed or
+            # already-failed task is a no-op that preserves its result) so a
+            # dead stage's exception — stored on the task, never awaited, and
+            # otherwise swallowed by the teardown gather — can be surfaced.
+            for task in tasks:
+                task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failure = next(
+                (
+                    result
+                    for result in results
+                    if isinstance(result, BaseException)
+                    and not isinstance(result, asyncio.CancelledError)
+                ),
+                None,
+            )
+            expected_end = (
+                not self.request.streaming
+                and self.yielded_count == self.request.num_groups
+            )
+            if failure is not None or not expected_end:
+                raise RuntimeError(
+                    "RolloutPipeline output stream ended: a pipeline stage died"
+                    + ("" if failure is not None else " (no stage exception was recovered)")
+                ) from failure
         finally:
             for task in tasks:
                 task.cancel()
