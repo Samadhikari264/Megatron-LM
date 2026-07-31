@@ -60,6 +60,7 @@ class TokenRollout(AgentBaseModel):
     env_id: str = ''
     problem_id: str | None = None
     completion_ids: list[str] = []
+    generation_cap: int | None = None
 
 
 Rollouts = list[TokenRollout | Rollout]
