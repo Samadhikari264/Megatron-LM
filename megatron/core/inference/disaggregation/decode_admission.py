@@ -26,6 +26,8 @@ def can_admit_prefilled_decode(context, input_token_count: int) -> bool:
         return False
     if context.active_token_count + input_token_count > context.max_tokens:
         return False
+    if context.is_hybrid_model and context.mamba_metadata.mamba_state_free_slot_count < 1:
+        return False
     return True
 
 
@@ -35,12 +37,14 @@ def admit_prefilled_decode(
     prompt_block_ids: list[int],
     continuation_block_ids: list[int],
     input_tokens: list[int],
+    ssm_state_block_id: int | None = None,
 ) -> None:
-    """Admit imported KV state directly as an active decode request.
+    """Admit imported KV/SSM state directly as an active decode request.
 
     The imported prompt blocks already carry one allocator reference. This
-    function transfers that ownership to the live request and schedules the
-    sampled first token (plus any MTP proposals) as the next decode query.
+    function transfers that ownership to the live request, binds the exact
+    post-prompt recurrent state, and schedules the sampled first token (plus
+    any MTP proposals) as the next decode query.
     """
 
     input_token_count = len(input_tokens)
@@ -70,6 +74,14 @@ def admit_prefilled_decode(
         )
     if request.get_metadata_types() != context.request_metadata_types:
         raise ValueError("Imported request metadata does not match the decode context")
+
+    ssm_state_idx = None
+    if context.is_hybrid_model:
+        if ssm_state_block_id is None:
+            raise ValueError("A hybrid decode request requires an exact imported SSM state")
+        ssm_state_idx = context.mamba_metadata.allocate_slot()
+        if ssm_state_idx is None:
+            raise RuntimeError("No live SSM state slot available for imported decode state")
 
     current_id = context.total_request_count
     all_block_ids = prompt_block_ids + continuation_block_ids
@@ -128,6 +140,11 @@ def admit_prefilled_decode(
     context.token_to_block_idx[token_start:token_end] = block_ids_tensor[
         token_positions // context.block_size_tokens
     ]
+
+    if context.is_hybrid_model:
+        assert ssm_state_idx is not None
+        context.mamba_metadata.request_to_mamba_state_idx[current_id] = ssm_state_idx
+        context._pending_mamba_restores.append((current_id, ssm_state_block_id, ssm_state_idx))
 
     context.active_token_count = token_end
     context.total_request_count += 1
