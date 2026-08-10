@@ -205,13 +205,24 @@ def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
 
 def test_compute_cp_indexer_topk_passes_offsets_without_repacking_k(monkeypatch):
     topk_calls = []
+    callback_events = []
 
     def fake_indexer_topk(
-        q, k, _weights, *, topk, cu_seqlens_q, cu_seqlens_kv, q_causal_offsets, **_
+        q,
+        k,
+        _weights,
+        *,
+        topk,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        q_causal_offsets,
+        after_score_init,
+        **_,
     ):
         topk_calls.append(
             (k.clone(), cu_seqlens_q.clone(), cu_seqlens_kv.clone(), q_causal_offsets.clone())
         )
+        after_score_init()
         return torch.full((q.shape[0], int(topk)), len(topk_calls), dtype=torch.int32), None
 
     monkeypatch.setattr(csa_cp_utils, "indexer_topk", fake_indexer_topk)
@@ -234,9 +245,11 @@ def test_compute_cp_indexer_topk_passes_offsets_without_repacking_k(monkeypatch)
         indexer_softmax_scale=0.5,
         max_seqlen_q=8,
         use_fused=True,
+        after_score_init=lambda: callback_events.append("score_initialized"),
     )
 
     assert torch.equal(out, torch.ones(8, 2, dtype=torch.int32))
+    assert callback_events == ["score_initialized"]
     assert torch.equal(topk_calls[0][0], k_seq)
     assert torch.equal(topk_calls[0][1], torch.tensor([0, 0, 6, 8, 8], dtype=torch.int32))
     assert torch.equal(topk_calls[0][2], torch.tensor([0, 1, 3, 4, 4], dtype=torch.int32))
@@ -268,6 +281,7 @@ def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch
     ratio = 4
     topk_width = 3
     scale = 0.7
+    callback_events = []
 
     actual, _ = compute_cp_indexer_topk(
         q,
@@ -281,8 +295,10 @@ def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch
         indexer_softmax_scale=scale,
         max_seqlen_q=8,
         use_fused=False,
+        after_score_init=lambda: callback_events.append("score_initialized"),
     )
 
+    assert callback_events == ["score_initialized"]
     expected = torch.full((q.shape[0], topk_width), -1, dtype=torch.int32)
     for local_row, global_row in enumerate(range(7, 15)):
         seq = next(i for i in range(len(cu_q) - 1) if global_row < int(cu_q[i + 1]))
