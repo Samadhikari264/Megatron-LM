@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
@@ -20,6 +21,8 @@ from ..inference import (
     ReturnsRaw,
 )
 from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
+
+logger = logging.getLogger(__name__)
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -357,6 +360,7 @@ class _RolloutPipeline:
         self.inferred_count = 0
         self.assembled_count = 0
         self.filtered_count = 0
+        self.refilled_placeholder_groups = 0
         self.yielded_count = 0
 
     async def _submit_group(self, *, group_id: int, batch_id: int, index_in_batch: int) -> None:
@@ -484,7 +488,7 @@ class _RolloutPipeline:
             self.filter_queue.shutdown()
 
     async def stage_filter(self) -> None:
-        """Deliver assembled groups, regenerating any dropped by the reward filter."""
+        """Deliver assembled groups, regenerating placeholder-poisoned or filter-dropped ones."""
         try:
             while True:
                 try:
@@ -495,8 +499,26 @@ class _RolloutPipeline:
                 if assembled.assembled_at:
                     self.filter_queue_dwell.append(dequeued_at - assembled.assembled_at)
                 group = assembled.group
-                if self._should_drop(group):
-                    self.filtered_count += 1
+                # All-placeholder groups carry zero salvageable work and must be refilled.
+                _placeholder = all(not rollout.trajectory for rollout in group.rollouts)
+                if _placeholder or self._should_drop(group):
+                    if _placeholder:
+                        self.refilled_placeholder_groups += 1
+                        if (
+                            self.refilled_placeholder_groups == 1
+                            or self.refilled_placeholder_groups % 32 == 0
+                        ):
+                            logger.warning(
+                                "Refilling all-placeholder group (batch %s slot %s): %d "
+                                "refilled so far. Groups whose episodes all failed are "
+                                "regenerated instead of reaching the trainer; a climbing "
+                                "count means episodes are failing upstream of the pipeline.",
+                                group.batch_id,
+                                group.index_in_batch,
+                                self.refilled_placeholder_groups,
+                            )
+                    else:
+                        self.filtered_count += 1
                     # G/B gate slots free on consumption, which a dropped group
                     # never reaches: like its in-flight count, its slot carries
                     # over to the replacement (no release here, no fresh "G"

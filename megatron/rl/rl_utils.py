@@ -1213,6 +1213,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
             f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
             f"{env_id}_pipeline_filtered_count": pipeline.filtered_count,
+            f"{env_id}_pipeline_refilled_placeholder_groups": pipeline.refilled_placeholder_groups,
             f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
         })
         for name, samples in (
@@ -1238,6 +1239,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
         pipeline.inferred_count = 0
         pipeline.assembled_count = 0
         pipeline.filtered_count = 0
+        pipeline.refilled_placeholder_groups = 0
         pipeline.yielded_count = 0
         gate.prepare_blocked_seconds = 0.0
         gate.acquire_calls = 0
