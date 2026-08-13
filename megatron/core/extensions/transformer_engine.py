@@ -1583,6 +1583,33 @@ class TERowParallelLinear(TELinear):
             super().backward_dw()
 
 
+def _get_packed_seq_params_kwargs(
+    packed_seq_params: Optional[PackedSeqParams],
+    kept_packed_seq_params: Set[str],
+    default_qkv_format: str,
+) -> Tuple[Dict[str, Any], str]:
+    """Return TE kwargs for real THD packing metadata and the effective QKV format."""
+    if packed_seq_params is None:
+        return {}, default_qkv_format
+
+    qkv_format = getattr(packed_seq_params, "qkv_format", None) or default_qkv_format
+    if qkv_format != "thd":
+        return {}, qkv_format
+
+    packed_seq_kwargs = {key: getattr(packed_seq_params, key) for key in kept_packed_seq_params}
+    if packed_seq_kwargs.get("pad_between_seqs") is False:
+        # Megatron represents end padding as dummy THD sequences. TE DPA
+        # sizes THD outputs from cu_seqlens_q/kv, so pass padded
+        # boundaries as the effective attention boundaries while keeping
+        # the original PackedSeqParams metadata intact for downstream
+        # loss/routing paths.
+        if packed_seq_kwargs.get("cu_seqlens_q_padded") is not None:
+            packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
+        if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
+            packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
+    return packed_seq_kwargs, qkv_format
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -1758,6 +1785,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
+        self.kept_packed_seq_params.discard("cp_partition_route")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1829,25 +1857,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"Transformer-Engine v{get_te_version()} must be >= 2.10.0 to support" "num_splits."
             )
 
-        packed_seq_kwargs = (
-            {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
-            if packed_seq_params is not None
-            else {}
+        packed_seq_kwargs, qkv_format = _get_packed_seq_params_kwargs(
+            packed_seq_params,
+            self.kept_packed_seq_params,
+            self.qkv_format,
         )
-        if (
-            packed_seq_kwargs.get("qkv_format") == "thd"
-            and packed_seq_kwargs.get("pad_between_seqs") is False
-        ):
-            # Megatron represents end padding as dummy THD sequences. TE DPA
-            # sizes THD outputs from cu_seqlens_q/kv, so pass padded
-            # boundaries as the effective attention boundaries while keeping
-            # the original PackedSeqParams metadata intact for downstream
-            # loss/routing paths.
-            if packed_seq_kwargs.get("cu_seqlens_q_padded") is not None:
-                packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
-            if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
-                packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
-        qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
         if attention_bias is not None:

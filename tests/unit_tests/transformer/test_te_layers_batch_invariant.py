@@ -12,8 +12,10 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
+    _get_packed_seq_params_kwargs,
     te_general_gemm,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
@@ -87,6 +89,19 @@ def _random_splits(total, num_parts):
             delta -= 1
         i = (i + 1) % len(lens)
     return lens
+
+
+def test_sbhd_packed_seq_params_only_overrides_qkv_format():
+    packed_seq_params = PackedSeqParams(qkv_format="sbhd", cp_partition_mode="zigzag")
+
+    packed_seq_kwargs, qkv_format = _get_packed_seq_params_kwargs(
+        packed_seq_params,
+        {"qkv_format", "cu_seqlens_q", "cu_seqlens_kv", "max_seqlen_q", "max_seqlen_kv"},
+        "sbhd",
+    )
+
+    assert packed_seq_kwargs == {}
+    assert qkv_format == "sbhd"
 
 
 # ============================================================================
