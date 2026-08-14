@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import io
+import json
 import logging
 import os
 import pathlib
@@ -17,6 +18,24 @@ PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 GITHUB_REPO = os.getenv("GITHUB_REPOSITORY", "NVIDIA/Megatron-LM")
 
 logger = logging.getLogger(__name__)
+
+
+def _remove_nan_iteration_time(golden_values_path: pathlib.Path):
+    """Remove a NaN at the iteration-time start step."""
+    golden_values = json.loads(golden_values_path.read_text())
+    iteration_time = golden_values.get("iteration-time")
+    if not iteration_time:
+        return
+
+    values = iteration_time.get("values")
+    start_step = iteration_time.get("start_step")
+    start_step_key = str(start_step)
+    if not values or values.get(start_step_key) != "nan":
+        return
+
+    del values[start_step_key]
+    iteration_time["start_step"] = int(next(iter(values)))
+    golden_values_path.write_text(json.dumps(golden_values, indent=4))
 
 
 def download_from_gitlab(pipeline_id: int, only_failing: bool):
@@ -361,6 +380,7 @@ def _move_golden_values(golden_values_files: list, stage: str, test_name: str) -
     golden_values_moved = 0
 
     for golden_values_file in golden_values_files:
+        _remove_nan_iteration_time(golden_values_file)
         golden_values_target = (
             pathlib.Path("tests")
             / "functional_tests"
