@@ -8028,11 +8028,10 @@
         }
     },
     "iteration-time": {
-        "start_step": 1,
+        "start_step": 2,
         "end_step": 2000,
         "step_interval": 1,
         "values": {
-            "1": "nan",
             "2": 13.49082,
             "3": 7.93588,
             "4": 7.70109,
