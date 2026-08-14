@@ -5,14 +5,45 @@ from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    MambaInferenceStateConfig,
+)
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @staticmethod
+    def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                params_dtype=torch.bfloat16,
+                batch_invariant_mode=False,
+                experimental_attention_variant=experimental_attention_variant,
+            ),
+            decoder=SimpleNamespace(layer_type_list=layer_type_list, layers=[]),
+        )
+
+    def test_mamba_inference_state_config_rejects_mixed_recurrent_layers(self):
+        """Mamba and GDN cannot share one state shape and prefill chunk size."""
+        model = self._hybrid_model([Symbols.MAMBA, Symbols.GDN])
+
+        with pytest.raises(ValueError, match="mixing Mamba and GDN"):
+            MambaInferenceStateConfig.from_model(model)
+
+    def test_mamba_inference_state_config_rejects_gdn2(self):
+        """GDN2 should fail explicitly instead of missing the GDN inference hooks."""
+        model = self._hybrid_model([Symbols.GDN], experimental_attention_variant="gdn2")
+
+        with pytest.raises(NotImplementedError, match="GDN2"):
+            MambaInferenceStateConfig.from_model(model)
+
     def test_mutual_exclusivity_with_transformer_config(self):
         """
         Ensure mutual exclusivity between fields in `InferenceConfig` and
