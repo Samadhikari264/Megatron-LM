@@ -609,7 +609,7 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
 
 
 def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
-    """A training step should stay below five full-size child buffers."""
+    """A training step should stay below four full-size child buffers."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -642,16 +642,17 @@ def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
     train_step()
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
 
-    # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input,
-    # for a four-full-child-buffer peak. Allow one additional buffer for cuBLAS
-    # workspace, allocator granularity, and small temporaries.
-    bound_nbytes = (4 + 1) * child_weight_nbytes
+    # Before resharding, the current child, one prefetched child, and the current wgrad
+    # are live. Resharding releases the current weight before allocating the packed
+    # reduce-scatter input on the same stream, keeping the full-buffer peak at three.
+    # Allow one additional buffer for cuBLAS workspace, allocator granularity, and small
+    # temporaries.
+    bound_nbytes = (3 + 1) * child_weight_nbytes
 
     assert peak_delta < bound_nbytes, (
         "FSDP training-step peak memory exceeded the full-size-buffer bound: "
         f"rank={rank}, peak_delta={_mb(peak_delta)}, "
-        f"five_full_child_buffers={_mb(bound_nbytes)}"
+        f"four_full_child_buffers={_mb(bound_nbytes)}"
     )
 
 
@@ -859,8 +860,8 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_mem
     gemm_streams = {kernel.device_resource_id for kernel in gemm_kernels}
     if allgather_kernels:
         assert len(allgather_streams) == 1
+        assert allgather_streams == reduce_scatter_streams
     assert len(reduce_scatter_streams) == 1
-    assert allgather_streams.isdisjoint(reduce_scatter_streams)
     assert allgather_streams.isdisjoint(gemm_streams)
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
