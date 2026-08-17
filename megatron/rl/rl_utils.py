@@ -847,7 +847,7 @@ def get_environment_rollouts(
         # regardless of completion order due to system timing jitter.
         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
 
-    with nvtx_range("rl/sync-rollouts", time=True):
+    with nvtx_range("rl/sync-rollout-state", time=True):
         # Wait for Rollouts to be collected
         # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
         torch.distributed.broadcast_object_list(rollouts, src=0)
