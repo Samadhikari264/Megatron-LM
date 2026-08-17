@@ -1477,7 +1477,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             output_size,
             gtp_remat_group,
             extra_kwargs,
-            is_expert=is_expert,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
         )
