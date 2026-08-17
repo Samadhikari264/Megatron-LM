@@ -303,16 +303,15 @@ class TestRLUtils:
         assert captured["request"].submission_granularity == submission_granularity
 
     @pytest.mark.parametrize(
-        "ready_batches, partial_rollouts, expected_skip",
+        "ready_batches, expected_skip",
         [
-            pytest.param(1, True, True, id="banked_batch_skips"),
-            pytest.param(0, True, False, id="empty_bank_runs_inference"),
-            pytest.param(1, False, False, id="non_partial_always_runs_inference"),
-            pytest.param(None, True, False, id="no_pipeline_runs_inference"),
+            pytest.param(1, True, id="banked_batch_skips"),
+            pytest.param(0, False, id="empty_bank_runs_inference"),
+            pytest.param(None, False, id="no_pipeline_runs_inference"),
         ],
     )
     def test_can_skip_inference_routes_rollout_collection(
-        self, monkeypatch, ready_batches, partial_rollouts, expected_skip
+        self, monkeypatch, ready_batches, expected_skip
     ):
         """can_skip_inference cold-reads the pipeline bank; a skip routes
         get_environment_rollouts to consume banked groups without inference."""
@@ -344,7 +343,7 @@ class TestRLUtils:
                 patch("torch.distributed.broadcast_object_list"),
                 patch("torch.are_deterministic_algorithms_enabled", return_value=False),
             ):
-                skip = rl_utils.can_skip_inference(partial_rollouts)
+                skip = rl_utils.can_skip_inference()
                 assert skip == expected_skip
                 rollouts, fresh_ledger = rl_utils.get_environment_rollouts(
                     [MagicMock()],

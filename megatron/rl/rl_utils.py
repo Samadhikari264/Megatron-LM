@@ -669,9 +669,9 @@ def get_rollout_generator(
     return _ROLLOUT_GENERATOR
 
 
-def can_skip_inference(partial_rollouts: bool) -> bool:
+def can_skip_inference() -> bool:
     """Return True when a full batch of rollout groups is already banked; no context switch."""
-    if not partial_rollouts or _ROLLOUT_PIPELINE is None:
+    if _ROLLOUT_PIPELINE is None:
         return False
     skip = False
     if torch.distributed.get_rank() == 0:
@@ -2275,7 +2275,6 @@ def get_grpo_data_iterator(
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
     optimizer_is_on_cpu: bool = False,
-    partial_rollouts: bool = False,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -2296,7 +2295,6 @@ def get_grpo_data_iterator(
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
         optimizer_is_on_cpu: If True, the optimizer is offloaded to CPU during inference.
-        partial_rollouts: If True, skip the inference context switch when we have enough data.
 
     Returns:
         RerunDataIterator for the current training step
@@ -2312,7 +2310,7 @@ def get_grpo_data_iterator(
         (grpo_iterations * global_batches_per_collection)
     ):
 
-        run_inference = not can_skip_inference(partial_rollouts)
+        run_inference = not can_skip_inference()
         if run_inference:
             runtime_state.inference_ran += 1
         else:
