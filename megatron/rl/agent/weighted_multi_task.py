@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+from collections import deque
 from typing import Any, Optional, Type
 
-from .registry import get_agent_class
+from ..types import GroupedRollouts, GroupQueuesPerEnv, RolloutGroup
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -20,6 +21,7 @@ from .api import (
     RolloutGenerator,
     RolloutRequest,
 )
+from .registry import get_agent_class
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,11 @@ class WeightedMultiTask(
         self.agents = []
         self.weights = []
         self.agent_configs = agent_configs  # Store the configs for later use
+        # Recovered rollout-bank groups are another producer for each environment.
+        # ``None`` means recovery was not configured; an empty dict means recovery
+        # ran but found no groups. The distinction avoids requiring env_ids when the
+        # durable bank is disabled.
+        self._restored_groups: GroupQueuesPerEnv | None = None
 
         # Calculate total weight only among non-evaluation agents
         total_weight = sum(config.weight for config in agent_configs if not config.evaluation_only)
@@ -67,6 +74,9 @@ class WeightedMultiTask(
                 self.weights.append(0.0)
             else:
                 self.weights.append(config.weight / total_weight)
+            # Curriculum cursors seed from iteration * prompts_per_step, but each
+            # sub-agent only serves its normalized share of those prompts.
+            agent._prompt_share = self.weights[-1]
 
     @classmethod
     def from_config(cls, config: list[dict[str, Any]]) -> 'WeightedMultiTask':
@@ -148,13 +158,57 @@ class WeightedMultiTask(
 
         return final_counts
 
+    def _env_ids(self) -> list[str]:
+        """Return per-agent env IDs used to route restored rollout-bank groups."""
+        active_agents = [weight > 0 for weight in self.weights]
+        require_env_ids = sum(active_agents) > 1
+        env_ids = []
+        for index, (agent, is_active) in enumerate(zip(self.agents, active_agents)):
+            env_id = getattr(agent, "env_id", None)
+            if not env_id and is_active and require_env_ids:
+                raise ValueError(
+                    f"Active agent {index} ({type(agent).__name__}) has no env_id; it is "
+                    "required to weight-balance restored rollout-bank groups by env. "
+                    "Set env_id when configuring multiple active agents."
+                )
+            env_ids.append(env_id or ("" if is_active else f"agent_{index}"))
+        return env_ids
+
+    def set_restored_groups(self, groups: GroupedRollouts) -> int:
+        """Install recovered rollout-bank groups as per-environment producers."""
+        known_env_ids = set(self._env_ids())
+        restored: GroupQueuesPerEnv = {}
+        for group in groups:
+            if not group:
+                continue
+            env_id = group[0].env_id
+            if env_id not in known_env_ids:
+                raise ValueError(
+                    f"Restored rollout-bank group has env_id {env_id!r} which is not in the "
+                    f"current --langrl-env-config (known: {sorted(known_env_ids)}). Changing "
+                    "the environment set across a crash-resume is unsupported; resume with a "
+                    "matching config or clear the rollout bank."
+                )
+            restored.setdefault(env_id, deque()).append(group)
+        self._restored_groups = restored
+        return sum(len(queue) for queue in restored.values())
+
+    def take_restored_group(self, env_id: str) -> RolloutGroup | None:
+        """Return the next recovered group for an environment, if available."""
+        restored = (self._restored_groups or {}).get(env_id)
+        return restored.popleft() if restored else None
+
     def rollout_allocations(self, num_groups: int) -> list[EnvAllocation]:
         """Constant per-batch allocation for each weighted env, in env order."""
         counts = self._distribute_counts(num_groups)
-        env_ids = [
-            getattr(agent, "env_id", None) or f"agent_{idx}"
-            for idx, agent in enumerate(self.agents)
-        ]
+        env_ids = (
+            self._env_ids()
+            if self._restored_groups is not None
+            else [
+                getattr(agent, "env_id", None) or f"agent_{idx}"
+                for idx, agent in enumerate(self.agents)
+            ]
+        )
         starved = [
             env_ids[idx]
             for idx, count in enumerate(counts)

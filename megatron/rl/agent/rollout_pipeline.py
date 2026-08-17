@@ -13,14 +13,11 @@ from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..inference import ReturnsRaw
-from ..rollout_granularity import (
-    GRANULARITY_RANK,
-    ConsumptionGranularity,
-    SubmissionGranularity,
-)
+from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
 from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
 
 if TYPE_CHECKING:
+    from ..rollout_bank import RolloutBank
     from .api import GroupedRolloutGenerator
 
 
@@ -208,6 +205,8 @@ class RolloutPipeline:
         agent: "GroupedRolloutGenerator",
         request: GroupedRolloutRequest,
         parallel_generation_tasks: int,
+        bank: "RolloutBank | None" = None,
+        initial_batch_id: int = 0,
     ) -> None:
         """Validate the request and size the gate, queues, and worker pool.
 
@@ -215,12 +214,16 @@ class RolloutPipeline:
             agent: Agent supplying the env layout, preparation, and inference.
             request: Grouped rollout request to serve; one pipeline per request.
             parallel_generation_tasks: Submission gate depth in trainer batches.
+            bank: Optional durable store for freshly completed rollout groups.
+            initial_batch_id: Batch ID assigned to the first batch in this pipeline.
         """
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
         self.agent = agent
         self.request = request
+        self.bank = bank
+        self.initial_batch_id = initial_batch_id
         self.allocations = agent.rollout_allocations(request.num_groups)
         self.gran_policy = _GranularityConfig.from_request(
             request, [allocation.num_groups for allocation in self.allocations]
@@ -314,12 +317,24 @@ class RolloutPipeline:
         try:
             while self.request.streaming or group_id < self.request.num_groups:
                 await self.gate.acquire_for("B")
-                batch_id = group_id // self.gran_policy.num_groups_per_batch
+                batch_id = (
+                    self.initial_batch_id
+                    + group_id // self.gran_policy.num_groups_per_batch
+                )
 
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     env_index = self.gran_policy.env_of_index(index_in_batch)
                     await self.gate.acquire_for("G")
-                    agent = self.allocations[env_index].agent
+                    allocation = self.allocations[env_index]
+                    restored = self.agent.take_restored_group(allocation.env_id)
+                    if restored is not None:
+                        restored.batch_id = batch_id
+                        restored.index_in_batch = index_in_batch
+                        self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
+                        await self.output_queue.put(restored)
+                        group_id += 1
+                        continue
+                    agent = allocation.agent
                     params: GroupRolloutParams = await agent.prepare_group_rollout(self.request)
                     self.prepared_groups_per_env[env_index] += 1
 
@@ -421,13 +436,14 @@ class RolloutPipeline:
                     self._output_enqueued_at[
                         (first.item.batch_id, first.item.index_in_batch)
                     ] = output_enqueued_at
-                    await self.output_queue.put(
-                        RolloutGroup(
-                            rollouts=rollouts,
-                            batch_id=first.item.batch_id,
-                            index_in_batch=first.item.index_in_batch,
-                        )
+                    group = RolloutGroup(
+                        rollouts=rollouts,
+                        batch_id=first.item.batch_id,
+                        index_in_batch=first.item.index_in_batch,
                     )
+                    if self.bank is not None:
+                        group.uid = self.bank.append(group)
+                    await self.output_queue.put(group)
         finally:
             self.output_queue.shutdown()
 
@@ -490,7 +506,7 @@ class RolloutPipeline:
 
     async def _consume_batch_order(self) -> AsyncIterator[RolloutGroup]:
         """B consumption: deliver whole batches in dataset order."""
-        next_batch_id = 0
+        next_batch_id = self.initial_batch_id
         pending = self._consume_pending
         while (group := await self._next_complete_group()) is not None:
             pending.setdefault(group.batch_id, []).append(group)
